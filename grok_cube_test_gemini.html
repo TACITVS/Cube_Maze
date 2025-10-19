@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ECS Maze with Floorplan and Tiled Blocks (Proper Maze)</title>
+    <style> body { margin: 0; } canvas { display: block; } </style>
+    <script src="https://unpkg.com/lil-gui@0.18.2/dist/lil-gui.umd.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as CANNON from 'cannon-es';
+
+        // ECS (unchanged)
+        class ECS {
+            constructor() {
+                this.entities = {};
+                this.components = {};
+                this.systems = [];
+            }
+            createEntity(id) {
+                const key = String(id);
+                if (!this.entities[key]) {
+                    this.entities[key] = { id: id, active: true };
+                }
+                return id;
+            }
+            addComponent(entityId, type, data) {
+                const key = String(entityId);
+                if (!this.components[type]) this.components[type] = {};
+                this.components[type][key] = { ...data };
+            }
+            getComponent(entityId, type) {
+                const key = String(entityId);
+                return this.components[type]?.[key];
+            }
+            removeEntity(entityId) {
+                const key = String(entityId);
+                Object.keys(this.components).forEach(type => {
+                    delete this.components[type][key];
+                });
+                delete this.entities[key];
+            }
+            query(queries) {
+                return Object.entries(this.entities)
+                    .filter(([k, ent]) => ent.active)
+                    .map(([k, ent]) => ent.id)
+                    .filter(id => queries.every(type => this.getComponent(id, type)));
+            }
+            addSystem(systemFn) {
+                this.systems.push(systemFn);
+            }
+            update(delta) {
+                this.systems.forEach(system => system(this, delta));
+            }
+        }
+        const ecs = new ECS();
+
+        // Union-Find (unchanged)
+        class UnionFind {
+            constructor(size) {
+                this.parent = Array.from({length: size}, (_, i) => i);
+                this.rank = new Array(size).fill(0);
+            }
+            find(x) {
+                if (this.parent[x] !== x) this.parent[x] = this.find(this.parent[x]);
+                return this.parent[x];
+            }
+            union(x, y) {
+                let px = this.find(x), py = this.find(y);
+                if (px === py) return false;
+                if (this.rank[px] < this.rank[py]) {
+                    this.parent[px] = py;
+                } else {
+                    this.parent[py] = px;
+                    if (this.rank[px] === this.rank[py]) this.rank[px]++;
+                }
+                return true;
+            }
+        }
+
+        // Scene/Physics setup (unchanged)
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x222222);
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 10, 20);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.minPolarAngle = Math.PI / 4; // Limit downward view
+        controls.maxPolarAngle = Math.PI / 2 - 0.01; // Prevent under plane
+
+        let ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+        scene.add(ambientLight);
+        let directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+        directionalLight.position.set(10, 20, 5);
+        directionalLight.castShadow = true;
+        directionalLight.shadow.mapSize.width = 2048;
+        directionalLight.shadow.mapSize.height = 2048;
+        scene.add(directionalLight);
+
+        const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1);
+        scene.add(hemisphereLight);
+
+        const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+        world.broadphase = new CANNON.SAPBroadphase(world);
+        world.solver.iterations = 10;
+        world.allowSleep = true;
+
+        const defaultMaterial = new CANNON.Material('default');
+        const defaultContactMaterial = new CANNON.ContactMaterial(defaultMaterial, defaultMaterial, {
+            friction: 0.5, restitution: 0.2
+        });
+        world.addContactMaterial(defaultContactMaterial);
+
+        // --- MODIFIED: Use settings object for mazeSize ---
+        const settings = {
+            mazeSize: 5
+        };
+        const cubeSize = 1;
+        const halfExtents = new CANNON.Vec3(cubeSize / 2, cubeSize / 2, cubeSize / 2);
+
+        // --- MODIFIED: Uses settings.mazeSize ---
+        function createMazeTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512;
+            canvas.height = 512;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#000000'; // Walls
+            context.fillRect(0, 0, 512, 512);
+            context.fillStyle = '#ffffff'; // Paths
+
+            // Generate maze (Kruskal's on grid)
+            const numCells = settings.mazeSize * settings.mazeSize;
+            const uf = new UnionFind(numCells);
+            const hWalls = Array.from({length: settings.mazeSize}, () => Array(settings.mazeSize).fill(true));
+            const vWalls = Array.from({length: settings.mazeSize}, () => Array(settings.mazeSize - 1).fill(true));
+            const edges = [];
+            // Horizontal edges (left-right, remove vertical wall)
+            for (let r = 0; r < settings.mazeSize; r++) {
+                for (let c = 0; c < settings.mazeSize - 1; c++) {
+                    edges.push({ u: r * settings.mazeSize + c, v: r * settings.mazeSize + (c + 1), weight: Math.random(), isHorizontal: true, r, c });
+                }
+            }
+            // Vertical edges (up-down, remove horizontal wall)
+            for (let r = 0; r < settings.mazeSize - 1; r++) {
+                for (let c = 0; c < settings.mazeSize; c++) {
+                    edges.push({ u: r * settings.mazeSize + c, v: (r + 1) * settings.mazeSize + c, weight: Math.random(), isHorizontal: false, r, c });
+                }
+            }
+            edges.sort((a, b) => a.weight - b.weight);
+            for (const edge of edges) {
+                if (uf.union(edge.u, edge.v)) {
+                    if (edge.isHorizontal) {
+                        vWalls[edge.r][edge.c] = false;
+                    } else {
+                        hWalls[edge.r][edge.c] = false;
+                    }
+                }
+            }
+
+            // Draw maze on canvas (scale to grid)
+            const cellPx = 512 / (2 * settings.mazeSize + 1);
+            // Fill cells with white
+            for (let r = 0; r < settings.mazeSize; r++) {
+                for (let c = 0; c < settings.mazeSize; c++) {
+                    const pxR = (2 * r + 1) * cellPx;
+                    const pxC = (2 * c + 1) * cellPx;
+                    context.fillRect(pxC, pxR, cellPx, cellPx);
+                }
+            }
+            // Fill removed walls with white (open paths)
+            for (let r = 0; r < settings.mazeSize; r++) {
+                for (let c = 0; c < settings.mazeSize - 1; c++) {
+                    if (!vWalls[r][c]) {
+                        const pxR = (2 * r + 1) * cellPx;
+                        const pxC = (2 * c + 2) * cellPx;
+                        context.fillRect(pxC, pxR, cellPx, cellPx);
+                    }
+                }
+            }
+            for (let r = 0; r < settings.mazeSize - 1; r++) {
+                for (let c = 0; c < settings.mazeSize; c++) {
+                    if (!hWalls[r][c]) {
+                        const pxR = (2 * r + 2) * cellPx;
+                        const pxC = (2 * c + 1) * cellPx;
+                        context.fillRect(pxC, pxR, cellPx, cellPx);
+                    }
+                }
+            }
+
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // Ground Entity #0
+        // --- MODIFIED: Uses settings.mazeSize ---
+        ecs.createEntity(0);
+        ecs.addComponent(0, 'Render', {
+            mesh: (() => {
+                const groundGeometry = new THREE.PlaneGeometry(2 * settings.mazeSize + 1, 2 * settings.mazeSize + 1);
+                const mazeTexture = createMazeTexture();
+                const groundMaterial = new THREE.MeshLambertMaterial({ map: mazeTexture, side: THREE.DoubleSide });
+                const groundMesh = new THREE.Mesh(groundGeometry, groundMaterial);
+                groundMesh.rotation.x = -Math.PI / 2;
+                groundMesh.receiveShadow = true;
+                scene.add(groundMesh);
+                return groundMesh;
+            })()
+        });
+        ecs.addComponent(0, 'Physics', {
+            body: (() => {
+                const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane(), material: defaultMaterial });
+                groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+                world.addBody(groundBody);
+                return groundBody;
+            })()
+        });
+
+        // Tile with cubes based on floorplan with random colors and edges
+        // --- MODIFIED: Uses settings.mazeSize ---
+        function tileWithCubes() {
+            const canvas = createMazeTexture().image;
+            const context = canvas.getContext('2d');
+            const cellPx = 512 / (2 * settings.mazeSize + 1);
+            const imageData = context.getImageData(0, 0, 512, 512).data;
+
+            for (let r = 0; r < 2 * settings.mazeSize + 1; r++) {
+                for (let c = 0; c < 2 * settings.mazeSize + 1; c++) {
+                    const px = Math.floor(c * cellPx + cellPx / 2);
+                    const py = Math.floor(r * cellPx + cellPx / 2);
+                    const i = (py * 512 + px) * 4;
+                    if (imageData[i] === 0) { // Black pixel = wall
+                        const pos = new THREE.Vector3(c - settings.mazeSize, 0.5, r - settings.mazeSize);
+                        dropBlockAt(pos, true);
+                    }
+                }
+            }
+        }
+
+        // dropBlockAt (unchanged)
+        function dropBlockAt(initPos, isStatic = false) {
+            const id = nextEntityId++;
+            ecs.createEntity(id);
+            const quat = new THREE.Quaternion();
+
+            const colors = [];
+            for (let i = 0; i < 6; i++) {
+                const hue = Math.floor(Math.random() * 256); // 0-255
+                colors.push(new THREE.Color().setHSL(hue / 256, 0.7, 0.5));
+            }
+
+            const materials = [
+                new THREE.MeshLambertMaterial({ color: colors[0], side: THREE.DoubleSide }),
+                new THREE.MeshLambertMaterial({ color: colors[1], side: THREE.DoubleSide }),
+                new THREE.MeshLambertMaterial({ color: colors[2], side: THREE.DoubleSide }),
+                new THREE.MeshLambertMaterial({ color: colors[3], side: THREE.DoubleSide }),
+                new THREE.MeshLambertMaterial({ color: colors[4], side: THREE.DoubleSide }),
+                new THREE.MeshLambertMaterial({ color: colors[5], side: THREE.DoubleSide })
+            ];
+
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(cubeSize, cubeSize, cubeSize), materials);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            const edges = new THREE.EdgesGeometry(mesh.geometry);
+            const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x000000 }));
+            mesh.add(line); 
+            scene.add(mesh);
+            ecs.addComponent(id, 'Render', { mesh });
+
+            const body = new CANNON.Body({ 
+                mass: isStatic ? 0 : 1, 
+                type: isStatic ? CANNON.Body.STATIC : CANNON.Body.DYNAMIC,
+                shape: new CANNON.Box(halfExtents.clone()), 
+                material: defaultMaterial 
+            });
+            body.position.set(initPos.x, initPos.y, initPos.z);
+            body.quaternion.copy(quat);
+            world.addBody(body);
+            ecs.addComponent(id, 'Physics', { body });
+        }
+
+        // Selection (unchanged)
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        function onMouseClick(event) {
+            mouse.x = (event.clientX / renderer.domElement.clientWidth) * 2 - 1;
+            mouse.y = -(event.clientY / renderer.domElement.clientHeight) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const blockEntities = ecs.query(['Render']).filter(id => id !== 0);
+            const meshes = blockEntities.map(id => {
+                const renderComp = ecs.getComponent(id, 'Render');
+                return renderComp ? renderComp.mesh : null;
+            }).filter(mesh => mesh !== null);
+            const intersects = raycaster.intersectObjects(meshes);
+            if (intersects.length > 0) {
+                const selectedMesh = intersects[0].object;
+                selectedCubeId = blockEntities.find(id => {
+                    const renderComp = ecs.getComponent(id, 'Render');
+                    return renderComp && renderComp.mesh === selectedMesh;
+                });
+                if (selectedCubeId) {
+                    const phys = ecs.getComponent(selectedCubeId, 'Physics');
+                    const rend = ecs.getComponent(selectedCubeId, 'Render');
+                    if (rend && rend.mesh) {
+                        manipPos.x = rend.mesh.position.x;
+                        manipPos.y = rend.mesh.position.y;
+                        manipPos.z = rend.mesh.position.z;
+                        manipRot.x = rend.mesh.rotation.x;
+                        manipRot.y = rend.mesh.rotation.y;
+                        manipRot.z = rend.mesh.rotation.z;
+                        manipFolder.open();
+                        console.log(`Selected block #${selectedCubeId}`);
+                    }
+                }
+            }
+        }
+        renderer.domElement.addEventListener('click', onMouseClick);
+
+        // Particle System for explode (unchanged)
+        function createExplosionParticles(position, count = 20) {
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(count * 3);
+            const velocities = [];
+            for (let i = 0; i < count; i++) {
+                positions[i * 3] = (Math.random() - 0.5) * 0.5;
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 0.5;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 0.5;
+                velocities.push(new THREE.Vector3(
+                    (Math.random() - 0.5) * 10,
+                    Math.random() * 10 + 5,
+                    (Math.random() - 0.5) * 10
+                ));
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            const material = new THREE.PointsMaterial({ color: 0xffaa00, size: 0.1, transparent: true, opacity: 1 });
+            const particles = new THREE.Points(geometry, material);
+            particles.position.copy(position);
+            scene.add(particles);
+
+            const animateParticles = () => {
+                particles.rotation.y += 0.01;
+                const pos = particles.geometry.attributes.position.array;
+                for (let i = 0; i < count; i++) {
+                    pos[i * 3] += velocities[i].x * 0.016;
+                    pos[i * 3 + 1] += velocities[i].y * 0.016;
+                    pos[i * 3 + 2] += velocities[i].z * 0.016;
+                    velocities[i].y -= 9.82 * 0.016;
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+                material.opacity = Math.max(0, material.opacity - 0.005);
+                if (material.opacity > 0) {
+                    requestAnimationFrame(animateParticles);
+                } else {
+                    scene.remove(particles);
+                    geometry.dispose();
+                    material.dispose();
+                }
+            };
+            animateParticles();
+        }
+
+        // Systems (unchanged)
+        ecs.addSystem((ecs) => { world.step(1 / 60); });
+        ecs.addSystem((ecs) => {
+            const physicsEntities = ecs.query(['Physics', 'Render']);
+            physicsEntities.forEach(id => {
+                const phys = ecs.getComponent(id, 'Physics');
+                const rend = ecs.getComponent(id, 'Render');
+                if (phys.body && rend.mesh && id !== 0) {
+                    rend.mesh.position.set(phys.body.position.x, phys.body.position.y, phys.body.position.z);
+                    rend.mesh.quaternion.set(phys.body.quaternion.x, phys.body.quaternion.y, phys.body.quaternion.z, phys.body.quaternion.w);
+                }
+            });
+        });
+
+        // Maze params
+        let nextEntityId = 1;
+
+        // Initialize lil-gui
+        const gui = new lil.GUI();
+
+        // --- NEW: Maze Controls GUI ---
+        const mazeFolder = gui.addFolder('Maze Controls');
+        mazeFolder.add(settings, 'mazeSize', {
+            'Small (5x5)': 5,
+            'Medium (7x7)': 7,   // ~2x area
+            'Large (9x9)': 9,   // ~3x area
+            'X-Large (10x10)': 10  // 4x area
+        }).name('Maze Size').onChange(generateMazeAndSpawn);
+        mazeFolder.open();
+
+        // Light controls (unchanged)
+        const lightFolder = gui.addFolder('Light Controls');
+        lightFolder.add(directionalLight, 'intensity', 0, 2, 0.1).name('Directional Intensity');
+        lightFolder.add(directionalLight.position, 'x', -20, 20, 0.1).name('Light X');
+        lightFolder.add(directionalLight.position, 'y', 0, 30, 0.1).name('Light Y');
+        lightFolder.add(directionalLight.position, 'z', -20, 20, 0.1).name('Light Z');
+        lightFolder.add(ambientLight, 'intensity', 0, 1, 0.1).name('Ambient Intensity');
+        lightFolder.open();
+
+        // Manipulation GUI folder
+        // --- MODIFIED: Store controllers to update their min/max ---
+        const manipFolder = gui.addFolder('Manipulate Selected');
+        let selectedCubeId = null;
+        let manipPos = { x: 0, y: 0, z: 0 };
+        let manipRot = { x: 0, y: 0, z: 0 };
+        const manipXController = manipFolder.add(manipPos, 'x', -settings.mazeSize, settings.mazeSize, 0.1).onChange(updateManip);
+        manipFolder.add(manipPos, 'y', 0, 5, 0.1).onChange(updateManip);
+        const manipZController = manipFolder.add(manipPos, 'z', -settings.mazeSize, settings.mazeSize, 0.1).onChange(updateManip);
+        manipFolder.add(manipRot, 'x', 0, Math.PI * 2, 0.1).onChange(updateManip);
+        manipFolder.add(manipRot, 'y', 0, Math.PI * 2, 0.1).onChange(updateManip);
+        manipFolder.add(manipRot, 'z', 0, Math.PI * 2, 0.1).onChange(updateManip);
+        manipFolder.add({ explode: () => explodeSelected() }, 'explode');
+        manipFolder.open();
+
+        // updateManip (unchanged)
+        function updateManip() {
+            if (selectedCubeId) {
+                const rend = ecs.getComponent(selectedCubeId, 'Render');
+                const phys = ecs.getComponent(selectedCubeId, 'Physics');
+                if (rend && phys && rend.mesh) {
+                    rend.mesh.position.set(manipPos.x, manipPos.y, manipPos.z);
+                    rend.mesh.rotation.set(manipRot.x, manipRot.y, manipRot.z);
+                    phys.body.position.set(manipPos.x, manipPos.y, manipPos.z);
+                    phys.body.quaternion.setFromEuler(new THREE.Euler(manipRot.x, manipRot.y, manipRot.z));
+                }
+            }
+        }
+
+        // explodeSelected (unchanged)
+        function explodeSelected() {
+            if (!selectedCubeId) return;
+            const phys = ecs.getComponent(selectedCubeId, 'Physics');
+            const rend = ecs.getComponent(selectedCubeId, 'Render');
+            if (!phys || !rend || !rend.mesh) return;
+
+            createExplosionParticles(new THREE.Vector3(phys.body.position.x, phys.body.position.y, phys.body.position.z));
+            world.removeBody(phys.body);
+            scene.remove(rend.mesh);
+            rend.mesh.geometry.dispose();
+            rend.mesh.material.dispose();
+            ecs.removeEntity(selectedCubeId);
+            selectedCubeId = null;
+            manipFolder.close();
+        }
+
+        // --- HEAVILY MODIFIED: Now updates ground geometry, camera, and GUI sliders ---
+        function generateMazeAndSpawn() {
+            // Clear all but ground
+            const entitiesToRemove = ecs.query(['Physics']).filter(id => id !== 0);
+            entitiesToRemove.forEach(id => {
+                const phys = ecs.getComponent(id, 'Physics');
+                const rend = ecs.getComponent(id, 'Render');
+                if (phys?.body) world.removeBody(phys.body);
+                if (rend?.mesh) {
+                    scene.remove(rend.mesh);
+                    rend.mesh.geometry.dispose();
+                    if (Array.isArray(rend.mesh.material)) {
+                        rend.mesh.material.forEach(m => m.dispose());
+                    } else {
+                        rend.mesh.material.dispose();
+                    }
+                }
+                ecs.removeEntity(id);
+            });
+            nextEntityId = 1;
+            selectedCubeId = null;
+            manipFolder.close();
+
+            // NEW: Adjust camera based on maze size
+            camera.position.set(0, settings.mazeSize * 2, settings.mazeSize * 4);
+            controls.target.set(0, 0, 0); // Ensure controls are looking at the center
+            controls.update();
+
+            // NEW: Update manipulation slider limits and reset values
+            manipPos.x = 0;
+            manipPos.z = 0;
+            manipXController.min(-settings.mazeSize).max(settings.mazeSize).setValue(0);
+            manipZController.min(-settings.mazeSize).max(settings.mazeSize).setValue(0);
+
+
+            // Update floor texture AND geometry
+            const groundRender = ecs.getComponent(0, 'Render');
+            if (groundRender) {
+                // Update texture
+                const newTexture = createMazeTexture();
+                if (groundRender.mesh.material.map) {
+                     groundRender.mesh.material.map.dispose();
+                }
+                groundRender.mesh.material.map = newTexture;
+                groundRender.mesh.material.needsUpdate = true;
+                
+                // NEW: Update geometry
+                groundRender.mesh.geometry.dispose(); // Dispose old
+                groundRender.mesh.geometry = new THREE.PlaneGeometry( // Create new
+                    2 * settings.mazeSize + 1, 
+                    2 * settings.mazeSize + 1
+                );
+            }
+
+            // Tile with cubes
+            tileWithCubes();
+            console.log(`Maze (size ${settings.mazeSize}x${settings.mazeSize}) generated!`);
+        }
+
+        // Initial maze
+        generateMazeAndSpawn();
+
+        // --- MODIFIED: Now regenerates current size ---
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                console.log("Space pressed, regenerating maze...");
+                generateMazeAndSpawn();
+                e.preventDefault();
+            }
+        });
+
+        // animate (unchanged)
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const delta = clock.getDelta();
+            ecs.update(delta);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // resize listener (unchanged)
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
